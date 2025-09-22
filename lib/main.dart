@@ -1,11 +1,18 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:joi_mobile/firebase_options.dart';
 import 'package:joi_mobile/screens/login_screen.dart';
 import 'package:joi_mobile/services/database.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await DatabaseHelper.instance.database; // Initialize DB
+
+  // Initialize Firebase
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  // Initialize Database
+  await DatabaseHelper.instance.database;
+
   runApp(const MyApp());
 }
 

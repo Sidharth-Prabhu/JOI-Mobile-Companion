@@ -1,12 +1,13 @@
 import 'dart:async';
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:joi_mobile/services/database.dart';
 import 'package:joi_mobile/services/gemini_service.dart';
 import 'package:joi_mobile/screens/login_screen.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:wave/config.dart';
+import 'package:wave/wave.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 class ChatScreen extends StatefulWidget {
   final int userId;
@@ -18,11 +19,13 @@ class ChatScreen extends StatefulWidget {
   _ChatScreenState createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   final _messageController = TextEditingController();
   final _scrollController = ScrollController();
   List<Map<String, String>> _messages = [];
   bool _isTyping = false;
+  bool _isVoiceMode = false;
+  bool _isListening = false;
   Map<String, dynamic> _user = {};
   final List<String> _questionnaire = [
     "What's your age?",
@@ -31,18 +34,45 @@ class _ChatScreenState extends State<ChatScreen> {
     "What challenges are you facing right now?",
   ];
   final GeminiService _geminiService = GeminiService();
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  late AnimationController _voiceAnimationController;
+  late Animation<double> _voiceAnimation;
 
   @override
   void initState() {
     super.initState();
+    _geminiService.init();
+    _voiceAnimationController = AnimationController(
+      duration: const Duration(seconds: 1),
+      vsync: this,
+    );
+    _voiceAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
+      CurvedAnimation(
+        parent: _voiceAnimationController,
+        curve: Curves.easeInOut,
+      ),
+    );
     _loadUserAndConversations();
     _initializeNewChat();
   }
 
+  @override
+  void dispose() {
+    _geminiService.dispose();
+    _messageController.dispose();
+    _scrollController.dispose();
+    _voiceAnimationController.dispose();
+    super.dispose();
+  }
+
   Future<void> _loadUserAndConversations() async {
     final db = DatabaseHelper.instance;
-    _user = await db.getUser(widget.userId);
-    // Load user data but don't display old messages
+    try {
+      _user = await db.getUser(widget.userId) ?? {};
+    } catch (e) {
+      print('Error loading user: $e');
+      _user = {};
+    }
     setState(() {});
     _scrollToBottom();
   }
@@ -81,12 +111,57 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
   }
 
-  Future<void> _sendMessage() async {
-    final message = _messageController.text.trim();
-    if (message.isEmpty) return;
+  Future<void> _sendMessage({bool isVoice = false}) async {
+    String message = '';
 
-    _addMessage(message);
-    _messageController.clear();
+    if (isVoice && !_isListening) {
+      // Start voice recognition
+      setState(() => _isListening = true);
+      _voiceAnimationController.repeat(reverse: true);
+
+      bool available = await _speech.initialize(
+        onStatus: (status) => print('Speech status: $status'),
+        onError: (error) => print('Speech error: $error'),
+      );
+
+      if (available) {
+        await _speech.listen(
+          onResult: (result) {
+            setState(() {
+              message = result.recognizedWords;
+              if (result.finalResult) {
+                _messageController.text = message;
+              }
+            });
+          },
+          localeId: 'en_US',
+        );
+
+        // Stop after 5 seconds or when final result
+        Timer(const Duration(seconds: 5), () async {
+          await _speech.stop();
+          setState(() => _isListening = false);
+          _voiceAnimationController.stop();
+          _voiceAnimationController.reset();
+
+          if (message.isNotEmpty) {
+            _sendMessage(isVoice: false); // Process as text
+          }
+        });
+      } else {
+        setState(() => _isListening = false);
+        _addMessage('Voice recognition not available', isUser: false);
+      }
+      return;
+    }
+
+    if (!isVoice) {
+      message = _messageController.text.trim();
+      if (message.isEmpty) return;
+      _addMessage(message);
+      _messageController.clear();
+    }
+
     setState(() => _isTyping = true);
 
     final db = DatabaseHelper.instance;
@@ -100,9 +175,11 @@ class _ChatScreenState extends State<ChatScreen> {
       final response =
           'Updated your ${updateKey['key']} to ${updateKey['value']}. JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR\nHow can I assist you now?';
       _addMessage(response, isUser: false);
+      if (isVoice)
+        await _geminiService.speakText(response); // Speak in voice mode
       await db.insertConversation(widget.userId, message, response);
       setState(() => _isTyping = false);
-      _loadUserAndConversations(); // Refresh user data
+      _loadUserAndConversations();
       return;
     }
 
@@ -129,14 +206,16 @@ class _ChatScreenState extends State<ChatScreen> {
               "Thank you for completing the questionnaire! JOI - EVERYTHING YOU WANT TO SEE, EVERYTHING YOU WANT TO HEAR\nHow can I assist you now?";
         }
         _addMessage(response, isUser: false);
+        if (isVoice)
+          await _geminiService.speakText(response); // Speak in voice mode
         await db.insertConversation(widget.userId, message, response);
         setState(() => _isTyping = false);
-        _loadUserAndConversations(); // Refresh user data
+        _loadUserAndConversations();
         return;
       }
     }
 
-    // Use Gemini with enhanced emotional context from all stored conversations
+    // Generate response with Gemini
     final history = await db.getRecentConversations(widget.userId, limit: 10);
     final historyText = history
         .map((c) => 'User: ${c['message']}\nJOI: ${c['response']}')
@@ -148,6 +227,7 @@ class _ChatScreenState extends State<ChatScreen> {
       'hobbies': _user['profile_hobbies'] ?? 'unknown',
       'challenges': _user['profile_challenges'] ?? 'unknown',
     };
+
     final prompt =
         """
 ${GeminiService.joiSystemPrompt}
@@ -171,6 +251,8 @@ Respond with empathy and tailor your response to the user's emotional state, int
       _scrollToBottom();
     }
 
+    if (isVoice)
+      await _geminiService.speakText(accumulatedText); // Speak in voice mode
     await db.insertConversation(widget.userId, message, accumulatedText);
     setState(() => _isTyping = false);
   }
@@ -195,10 +277,14 @@ Respond with empathy and tailor your response to the user's emotional state, int
   Future<void> _logout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(builder: (_) => const LoginScreen()),
-    );
+    if (Navigator.canPop(context)) {
+      Navigator.pop(context);
+    } else {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+      );
+    }
   }
 
   @override
@@ -346,6 +432,12 @@ Respond with empathy and tailor your response to the user's emotional state, int
                                     width: 32,
                                     height: 32,
                                     fit: BoxFit.cover,
+                                    errorBuilder: (context, error, stackTrace) {
+                                      return const Icon(
+                                        Icons.person,
+                                        color: Colors.white,
+                                      );
+                                    },
                                   ),
                                 ),
                               ),
@@ -443,6 +535,32 @@ Respond with empathy and tailor your response to the user's emotional state, int
                   },
                 ),
               ),
+              // Voice visualization when listening
+              if (_isListening)
+                Container(
+                  height: 60,
+                  padding: const EdgeInsets.all(8.0),
+                  child: WaveWidget(
+                    config: CustomConfig(
+                      gradients: [
+                        [const Color(0xFF4EE0FF), const Color(0xFFB565FF)],
+                      ],
+                      durations: [
+                        3500,
+                      ], // Duration in milliseconds for wave animation
+                      heightPercentages: [
+                        0.25,
+                        0.30,
+                      ], // Percentage of height for each wave layer
+                      gradientBegin: Alignment.bottomLeft,
+                      gradientEnd: Alignment.topRight,
+                    ),
+                    size: Size(MediaQuery.of(context).size.width, 60),
+                    waveAmplitude: 10.0,
+                    backgroundColor: Colors.transparent,
+                  ),
+                ),
+              // Input row
               Container(
                 padding: const EdgeInsets.all(8.0),
                 decoration: BoxDecoration(
@@ -453,32 +571,110 @@ Respond with empathy and tailor your response to the user's emotional state, int
                 ),
                 child: Row(
                   children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _messageController,
-                        decoration: InputDecoration(
-                          hintText: 'Type your message...',
-                          hintStyle: TextStyle(
-                            color: Colors.white.withOpacity(0.5),
+                    if (!_isVoiceMode) ...[
+                      Expanded(
+                        child: TextField(
+                          controller: _messageController,
+                          enabled: !_isListening,
+                          decoration: InputDecoration(
+                            hintText: _isListening
+                                ? 'Listening...'
+                                : 'Type your message...',
+                            hintStyle: TextStyle(
+                              color: Colors.white.withOpacity(0.5),
+                            ),
+                            filled: true,
+                            fillColor: const Color(0xFF120E1C).withOpacity(0.8),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(20),
+                              borderSide: BorderSide.none,
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 12,
+                            ),
                           ),
-                          filled: true,
-                          fillColor: const Color(0xFF120E1C).withOpacity(0.8),
-                          border: OutlineInputBorder(
+                          style: const TextStyle(color: Colors.white),
+                          maxLines: null,
+                          minLines: 1,
+                          expands: false,
+                        ),
+                      ),
+                    ] else ...[
+                      Expanded(
+                        child: Container(
+                          height: 48,
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF120E1C).withOpacity(0.8),
                             borderRadius: BorderRadius.circular(20),
-                            borderSide: BorderSide.none,
                           ),
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
+                          child: Row(
+                            children: [
+                              AnimatedBuilder(
+                                animation: _voiceAnimation,
+                                builder: (context, child) {
+                                  return Transform.scale(
+                                    scale: _voiceAnimation.value,
+                                    child: Icon(
+                                      Icons.mic,
+                                      color: _isListening
+                                          ? Colors.red
+                                          : const Color(0xFF4EE0FF),
+                                      size: 24,
+                                    ),
+                                  );
+                                },
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  _isListening
+                                      ? 'Listening...'
+                                      : 'Tap to speak',
+                                  style: TextStyle(
+                                    color: Colors.white.withOpacity(0.7),
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                        style: const TextStyle(color: Colors.white),
-                        maxLines: null,
-                        minLines: 1,
-                        expands: false,
+                      ),
+                    ],
+                    const SizedBox(width: 8),
+                    // Voice mode toggle button
+                    Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            _isVoiceMode
+                                ? const Color(0xFFB565FF)
+                                : const Color(0xFF4EE0FF),
+                            _isVoiceMode
+                                ? const Color(0xFF4EE0FF)
+                                : const Color(0xFFB565FF),
+                          ],
+                        ),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: IconButton(
+                        icon: Icon(
+                          _isVoiceMode ? Icons.mic : Icons.text_fields,
+                          color: Colors.black,
+                        ),
+                        onPressed: () =>
+                            setState(() => _isVoiceMode = !_isVoiceMode),
+                        padding: const EdgeInsets.all(12),
+                        constraints: const BoxConstraints(
+                          minWidth: 48,
+                          minHeight: 48,
+                        ),
                       ),
                     ),
                     const SizedBox(width: 8),
+                    // Send button
                     Container(
                       decoration: BoxDecoration(
                         gradient: LinearGradient(
@@ -490,8 +686,13 @@ Respond with empathy and tailor your response to the user's emotional state, int
                         borderRadius: BorderRadius.circular(20),
                       ),
                       child: IconButton(
-                        onPressed: _sendMessage,
-                        icon: const Icon(Icons.send, color: Colors.black),
+                        onPressed: _isListening
+                            ? null
+                            : () => _sendMessage(isVoice: _isVoiceMode),
+                        icon: Icon(
+                          _isVoiceMode ? Icons.mic : Icons.send,
+                          color: Colors.black,
+                        ),
                         padding: const EdgeInsets.all(12),
                         constraints: const BoxConstraints(
                           minWidth: 48,
